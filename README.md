@@ -73,6 +73,21 @@ NCAR also maintains and releases the HRLDAS (High Resolution Land Data Assimilat
 For users who are interested in previous Noah-MP code versions (prior to version 5.0), please refer to the different GitHub branches in this repository. Particularly, the "release-v4.5-WRF" branch has the same model physics as the Noah-MP version 5.0, but with an old model code structures, which is consistent with the Noah-MP code released along with WRF version 4.5.
 
 
+## Debugging utility: noahmp-doctor
+
+`utility/noahmp-doctor.py` is a read-only Python 3 helper (standard library only) that assembles a single, copy-paste-ready report describing a failed Noah-MP run, so you can paste it into the LLM of your choice for diagnosis. It never modifies your run; by default it prints to standard output.
+
+Run it from your host-model run directory (or build directory) when a run fails:
+
+```
+python3 /path/to/noahmp/utility/noahmp-doctor.py             # auto-detect the log
+python3 /path/to/noahmp/utility/noahmp-doctor.py rsl.error.0000   # explicit log(s)
+python3 /path/to/noahmp/utility/noahmp-doctor.py -o report.txt    # also write a file
+```
+
+It collects the failing log tail (including MPI rank/ESMF logs such as `rsl.error.*` and `PET*.ESMF_LogFile`, surfacing the earliest fatal message), the namelist(s), the `user_build_options` build settings, the compiler/MPI and loaded-module provenance, scheduler environment, and git commit. Home directories, usernames, hostnames, and common scratch paths are redacted before output, with a summary of what was redacted so you can review the report before sharing it.
+
+
 ## Code contribution via GitHub
 
 Users are welcome to make code development and contributions through GitHub pull requests. The pull request will be reviewed by the Noah-MP model physics and code release team, and if everything looks good, the pull request of new code development or bug fixes will be merged into the develop branch. During each year's major version release period, the updated develop branch will be further merged into the master branch for official release of a new Noah-MP model version.
