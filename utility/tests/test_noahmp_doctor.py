@@ -1,7 +1,8 @@
-"""Full-coverage tests for utility/noahmp-doctor.py.
+"""Tests for utility/noahmp-doctor.py.
 
 No network, no real HPC, no real compilers (subprocess probes are monkeypatched).
 Every path builds a fake run directory under tmp_path. First test suite in this repo.
+`detect_logs` returns (logs, omitted_count, missing_explicit); tests unpack accordingly.
 """
 from __future__ import annotations
 
@@ -28,32 +29,55 @@ def rundir(tmp_path: Path) -> Path:
 
 # ── log detection ────────────────────────────────────────────────────────────
 def test_detect_single_log(rundir):
-    logs = doctor.detect_logs(rundir, [])
+    logs, omitted, missing = doctor.detect_logs(rundir, [])
     assert any(p.name == "slurm-123.out" for p in logs)
+    assert omitted == 0 and missing == []
 
 
 def test_detect_explicit_override(rundir):
     custom = rundir / "my.log"
     custom.write_text("boom")
-    logs = doctor.detect_logs(rundir, [str(custom)])
-    assert [p.name for p in logs] == ["my.log"]
+    logs, _, missing = doctor.detect_logs(rundir, [str(custom)])
+    assert [p.name for p in logs] == ["my.log"] and missing == []
+
+
+def test_detect_explicit_relative_to_C(tmp_path):
+    # explicit relative log resolves against the -C dir, not process cwd
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "boom.out").write_text("forrtl: error")
+    logs, _, missing = doctor.detect_logs(run, ["boom.out"])
+    assert [p.name for p in logs] == ["boom.out"] and missing == []
+
+
+def test_detect_explicit_missing_reported(tmp_path):
+    logs, _, missing = doctor.detect_logs(tmp_path, ["nope.out"])
+    assert logs == [] and len(missing) == 1
 
 
 def test_detect_no_log(tmp_path):
-    assert doctor.detect_logs(tmp_path, []) == []
+    assert doctor.detect_logs(tmp_path, []) == ([], 0, [])
 
 
 def test_detect_skips_own_report(rundir):
     (rundir / "noahmp_doctor_report.txt").write_text("old report")
-    logs = doctor.detect_logs(rundir, [])
+    logs, _, _ = doctor.detect_logs(rundir, [])
     assert all(p.name != "noahmp_doctor_report.txt" for p in logs)
 
 
 def test_rank_logs_detected_first(tmp_path):
     (tmp_path / "rsl.error.0001").write_text("forrtl: severe segmentation fault")
     (tmp_path / "slurm-1.out").write_text("MPI_ABORT was invoked")
-    logs = doctor.detect_logs(tmp_path, [])
+    logs, _, _ = doctor.detect_logs(tmp_path, [])
     assert logs[0].name.startswith("rsl.error")  # rank logs ranked first
+
+
+def test_detect_caps_many_logs(tmp_path):
+    for i in range(50):
+        (tmp_path / f"rsl.error.{i:04d}").write_text("forrtl: error here")
+    logs, omitted, _ = doctor.detect_logs(tmp_path, [])
+    assert len(logs) == doctor.MAX_LOGS
+    assert omitted == 50 - doctor.MAX_LOGS
 
 
 # ── tail reading ─────────────────────────────────────────────────────────────
@@ -83,17 +107,30 @@ def test_read_tail_empty(tmp_path):
     assert isinstance(doctor.read_tail(e), str)
 
 
-# ── error scan (rank-aware first fatal) ──────────────────────────────────────
-def test_scan_errors_finds_keywords():
-    logs = [(Path("slurm-1.out"), "all good\nMPI_ABORT invoked\n"),
-            (Path("rsl.error.0001"), "forrtl: severe: segmentation fault\n")]
-    hits = doctor.scan_errors(logs)
+# ── error scan (streams each file from the top) ──────────────────────────────
+def test_scan_errors_finds_keywords(tmp_path):
+    a = tmp_path / "slurm-1.out"
+    a.write_text("all good\nMPI_ABORT invoked\n")
+    b = tmp_path / "rsl.error.0001"
+    b.write_text("forrtl: severe: segmentation fault\n")
+    hits = doctor.scan_errors([a, b])
     assert any("rsl.error" in h for h in hits)
     assert any("MPI_ABORT" in h for h in hits)
 
 
-def test_scan_errors_no_hits():
-    assert doctor.scan_errors([(Path("x.log"), "everything fine\n")]) == []
+def test_scan_errors_finds_fatal_above_tail(tmp_path):
+    # the true first fatal is far above the last 200 lines; scan must still find it
+    log = tmp_path / "rsl.error.0000"
+    lines = ["forrtl: severe (174): SIGSEGV at step 3"] + [f"noise {i}" for i in range(1000)]
+    log.write_text("\n".join(lines))
+    hits = doctor.scan_errors([log])
+    assert any("SIGSEGV" in h for h in hits)
+
+
+def test_scan_errors_no_hits(tmp_path):
+    log = tmp_path / "x.log"
+    log.write_text("everything fine\n")
+    assert doctor.scan_errors([log]) == []
 
 
 # ── source context ───────────────────────────────────────────────────────────
@@ -191,6 +228,33 @@ def test_env_no_fc(monkeypatch):
     assert "no FC" in env["compiler"]
 
 
+def test_env_fc_not_allowlisted_is_not_executed(monkeypatch):
+    # an arbitrary path from user_build_options must NOT be executed (read-only contract)
+    called = {"ran": False}
+
+    def spy(cmd):
+        called["ran"] = True
+        return "should not run"
+    monkeypatch.setattr(doctor, "_run", spy)
+    env = doctor.capture_environment("/some/evil/path/to/compiler")
+    assert "not executed" in env["compiler"]
+    # spy may still run for mpi/module probes, but never for the bad FC value:
+    assert "should not run" not in env["compiler"]
+
+
+def test_env_scheduler_redacts_secrets_and_hosts(monkeypatch):
+    monkeypatch.setattr(doctor, "_run", lambda cmd: "stub")
+    monkeypatch.setenv("SLURM_JOB_ID", "12345")
+    monkeypatch.setenv("SLURM_NODELIST", "node[001-004]")
+    monkeypatch.setenv("MPI_AUTH_TOKEN", "supersecret")
+    env = doctor.capture_environment(None)
+    sched = env["scheduler"]
+    assert "SLURM_JOB_ID=12345" in sched           # benign value kept
+    assert "supersecret" not in sched              # secret value scrubbed
+    assert "node[001-004]" not in sched            # host/node list scrubbed
+    assert "<REDACTED_SECRET>" in sched and "<REDACTED_HOST>" in sched
+
+
 def test_run_handles_missing_binary():
     # real _run against a guaranteed-absent command: must not raise
     out = doctor._run(["definitely_not_a_real_binary_xyz", "--version"])
@@ -253,6 +317,16 @@ def test_redact_summary_counts_match():
     assert summary["scratch"] == 2
 
 
+def test_redact_uppercase_and_broad_roots():
+    redact, summary = doctor.build_redactor()
+    out = redact("/Users/bob/run /pscratch/sd/x /global/u1/y /projects/abc/z")
+    assert "/Users/bob/run" not in out
+    assert "/pscratch/sd/x" not in out
+    assert "/global/u1/y" not in out
+    assert "/projects/abc/z" not in out
+    assert summary["generic"] >= 4
+
+
 # ── end-to-end integration ───────────────────────────────────────────────────
 def test_end_to_end(tmp_path, monkeypatch):
     # synthetic failed-run dir two levels under a build root
@@ -293,3 +367,10 @@ def test_main_output_file(rundir, monkeypatch, capsys):
     rc = doctor.main(["-C", str(rundir), "-o", str(target)])
     assert rc == 0
     assert target.is_file() and "Copy everything below" in target.read_text()
+
+
+def test_main_bad_directory_returns_nonzero(tmp_path, capsys):
+    missing = tmp_path / "does_not_exist"
+    rc = doctor.main(["-C", str(missing)])
+    assert rc == 2
+    assert "not a directory" in capsys.readouterr().err

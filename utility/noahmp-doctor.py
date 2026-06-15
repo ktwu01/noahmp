@@ -12,9 +12,6 @@ It gathers the context an expert would ask for (the failing log tail, the nameli
 the build options, compiler/MPI + module provenance, scheduler env, git state), redacts
 home/user/host/scratch paths, and prints ONE block you paste into the LLM you trust.
 
-Design / review:
-  ~/.gstack/projects/NCAR-noahmp/kw35262-master-design-20260614-182242.md
-
 Data flow:
 
     cwd ──► detect_logs ──► read_tail (seek-from-end) ──► scan_errors (first fatal)
@@ -46,6 +43,8 @@ TAIL_BYTES = 1_000_000          # seek-from-end window; constant memory on huge 
 EMBED_CAP_BYTES = 500_000       # max embedded log bytes (paste-ability guard)
 SUBPROCESS_TIMEOUT = 5          # seconds; never hang the user's terminal
 UPWARD_LEVELS = 6               # how far to walk up for Makefile / user_build_options
+MAX_LOGS = 12                   # cap inspected logs (a WRF run can have 1000s of rsl.*)
+SCAN_BYTES = 5_000_000          # how far into each log to stream-scan for first fatal
 
 NOT_FOUND = "not found"
 ERROR_KEYWORDS = re.compile(
@@ -64,14 +63,24 @@ FORTRAN_SRC_REF = re.compile(r"([A-Za-z0-9_./-]+\.[fF]9?0?):(\d+)")
 
 
 # ── log discovery & reading ──────────────────────────────────────────────────
-def detect_logs(cwd: Path, explicit: list[str]) -> list[Path]:
-    """Return the logs to inspect. Explicit paths win; else pattern-match cwd.
+def detect_logs(cwd: Path, explicit: list[str]) -> tuple[list[Path], int, list[str]]:
+    """Return (logs_to_inspect, omitted_count, missing_explicit).
 
-    Rank/ESMF logs are kept as a group so scan_errors can find the earliest fatal
-    across ranks (rank-0 scheduler logs often show only abort noise).
+    Explicit paths win and are resolved against `cwd` (so `-C run foo.out` works).
+    Otherwise pattern-match cwd. Rank/ESMF logs are kept as a group so the
+    first-fatal scan can look across ranks (rank-0 logs often show only abort
+    noise). Inspected logs are capped at MAX_LOGS, preferring non-empty files,
+    so a run dir with thousands of rsl.* files stays usable.
     """
     if explicit:
-        return [Path(p) for p in explicit if Path(p).is_file()]
+        resolved, missing = [], []
+        for p in explicit:
+            cand = Path(p)
+            if not cand.is_absolute():
+                cand = cwd / cand
+            (resolved if cand.is_file() else missing).append(cand)
+        return resolved[:MAX_LOGS], max(0, len(resolved) - MAX_LOGS), [str(m) for m in missing]
+
     found: list[Path] = []
     seen: set[Path] = set()
     for pat in LOG_PATTERNS:
@@ -80,7 +89,10 @@ def detect_logs(cwd: Path, explicit: list[str]) -> list[Path]:
             if p.is_file() and rp not in seen and p.name != "noahmp_doctor_report.txt":
                 seen.add(rp)
                 found.append(p)
-    return found
+    # prefer non-empty logs when capping
+    found.sort(key=lambda p: (p.stat().st_size == 0, p.name))
+    omitted = max(0, len(found) - MAX_LOGS)
+    return found[:MAX_LOGS], omitted, []
 
 
 def read_tail(path: Path) -> str:
@@ -107,15 +119,30 @@ def read_tail(path: Path) -> str:
         return f"{NOT_FOUND} (could not read {path.name}: {exc})"
 
 
-def scan_errors(logs: list[tuple[Path, str]]) -> list[str]:
-    """Earliest keyword-matching lines across all logs (rank-aware first-fatal)."""
+def scan_errors(logs: list[Path]) -> list[str]:
+    """First keyword-matching lines per log, scanned from the TOP of each file.
+
+    The real first fatal often precedes the MPI abort noise that lands in the
+    displayed tail, so this streams each file from the start (bounded by
+    SCAN_BYTES) rather than reusing the tail.
+    """
     hits: list[str] = []
-    for path, body in logs:
-        for line in body.splitlines():
+    for path in logs:
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(SCAN_BYTES)
+        except OSError:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        per_log = 0
+        for line in text.splitlines():
             if ERROR_KEYWORDS.search(line):
                 hits.append(f"[{path.name}] {line.strip()}")
-                if len(hits) >= 40:
-                    return hits
+                per_log += 1
+                if per_log >= 5 or len(hits) >= 40:
+                    break
+        if len(hits) >= 40:
+            break
     return hits
 
 
@@ -214,14 +241,32 @@ def _read_capped(p: Path, cap: int = 50_000) -> str:
 
 
 # ── environment provenance (sandboxed subprocess) ────────────────────────────
+# Only these probe binaries are ever executed. We do NOT execute an FC value
+# parsed from user_build_options (a project file): running an arbitrary path from
+# a file we read would violate the read-only contract. We allow the common,
+# well-known compiler/MPI driver names by exact basename match only.
+_ALLOWED_PROBES = {
+    "gfortran", "ifort", "ifx", "nvfortran", "pgfortran", "flang", "xlf", "xlf90",
+    "mpif90", "mpifort", "mpiifort", "ftn",
+}
+# Scheduler/MPI env keys whose VALUE may carry a secret or sensitive endpoint.
+_SECRET_KEY = re.compile(r"(TOKEN|SECRET|KEY|PASSWORD|PASSWD|CRED|AUTH)", re.IGNORECASE)
+# Scheduler env keys whose value is a host / node list / IP we should not leak.
+_HOSTY_KEY = re.compile(r"(HOST|NODE|NODELIST|ADDR|IP|SUBMIT)", re.IGNORECASE)
+
+
 def _run(cmd: list[str]) -> str:
-    """Run a probe command read-only with a hard timeout; never raise."""
+    """Run a probe command read-only with a hard timeout; never raise.
+
+    Captures bytes and decodes with errors='replace' so non-UTF/locale output
+    from a compiler or `module` cannot raise UnicodeDecodeError.
+    """
     try:
         res = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=SUBPROCESS_TIMEOUT, check=False,
+            cmd, capture_output=True, timeout=SUBPROCESS_TIMEOUT, check=False,
         )
-        out = (res.stdout or res.stderr or "").strip()
+        raw = res.stdout or res.stderr or b""
+        out = raw.decode("utf-8", errors="replace").strip()
         return out if out else "not detected (empty output)"
     except FileNotFoundError:
         return "not detected (command not on PATH; module may not be loaded)"
@@ -233,9 +278,17 @@ def _run(cmd: list[str]) -> str:
 
 def capture_environment(fc: str | None) -> dict[str, str]:
     env = {}
-    env["compiler"] = _run([fc, "--version"]) if fc else "not detected (no FC in user_build_options)"
     env["compiler_name"] = fc or NOT_FOUND
-    # MPI wrapper identity: -show / --showme reveals the underlying compiler+libs
+    # Execute --version ONLY for an allowlisted, bare compiler name. Never run an
+    # arbitrary path read from user_build_options.
+    if fc and os.path.basename(fc) in _ALLOWED_PROBES and "/" not in fc:
+        env["compiler"] = _run([fc, "--version"])
+    elif fc:
+        env["compiler"] = (f"not executed (value '{fc}' from user_build_options is "
+                           f"not an allowlisted bare compiler name; reported as-is)")
+    else:
+        env["compiler"] = "not detected (no FC in user_build_options)"
+    # MPI wrapper identity: -show reveals the underlying compiler+libs
     for wrapper in ("mpif90", "mpifort", "mpiifort"):
         show = _run([wrapper, "-show"])
         if not show.startswith("not detected"):
@@ -243,11 +296,19 @@ def capture_environment(fc: str | None) -> dict[str, str]:
             break
     else:
         env["mpi_wrapper"] = "not detected (no mpi wrapper on PATH)"
-    env["modules"] = _run(["bash", "-lc", "module list 2>&1"])
-    sched = {k: v for k, v in os.environ.items()
-             if k.startswith(("SLURM_", "PBS_", "LSB_", "OMPI_", "MPI_"))}
-    env["scheduler"] = ("\n".join(f"{k}={v}" for k, v in sorted(sched.items()))
-                        if sched else "not detected (no SLURM_/PBS_ env vars set)")
+    env["modules"] = _run(["/bin/bash", "-lc", "module list 2>&1"])
+    # Scheduler env: redact secret-bearing and host/node/IP-bearing values.
+    lines = []
+    for k, v in sorted(os.environ.items()):
+        if not k.startswith(("SLURM_", "PBS_", "LSB_", "OMPI_", "MPI_")):
+            continue
+        if _SECRET_KEY.search(k):
+            v = "<REDACTED_SECRET>"
+        elif _HOSTY_KEY.search(k):
+            v = "<REDACTED_HOST>"
+        lines.append(f"{k}={v}")
+    env["scheduler"] = ("\n".join(lines) if lines
+                        else "not detected (no SLURM_/PBS_ env vars set)")
     return env
 
 
@@ -281,9 +342,15 @@ def build_redactor():
         return path_map[original]
 
     scratch_re = re.compile(
-        r"(?:" + "|".join(re.escape(r) for r in SCRATCH_ROOTS) + r")/[^\s:'\"]*"
+        r"(?:" + "|".join(re.escape(r) for r in SCRATCH_ROOTS) + r")/[^\s:'\"]*",
+        re.IGNORECASE,
     )
-    generic_re = re.compile(r"(?:/home/|/u/|/users/)[^\s:'\"]*")
+    # broad, case-insensitive generic home/scratch roots seen across HPC sites
+    generic_re = re.compile(
+        r"(?:/home/|/u/|/users/|/Users/|/projects/|/pscratch/|/global/|/cluster/|/nobackup/)"
+        r"[^\s:'\"]*",
+        re.IGNORECASE,
+    )
 
     def redact(text: str) -> str:
         nonlocal summary
@@ -325,7 +392,7 @@ def render_report(sections: dict[str, str], redact, summary) -> str:
 
 # ── orchestration ────────────────────────────────────────────────────────────
 def build_sections(cwd: Path, explicit: list[str]) -> dict[str, str]:
-    logs = detect_logs(cwd, explicit)
+    logs, omitted, missing = detect_logs(cwd, explicit)
     log_bodies = [(p, read_tail(p)) for p in logs]
     bo_src, bo_text = find_build_options(cwd)
     fc = parse_fc(bo_text) if bo_text else None
@@ -334,10 +401,14 @@ def build_sections(cwd: Path, explicit: list[str]) -> dict[str, str]:
 
     sections: dict[str, str] = {}
     sections["run directory"] = str(cwd)
-    sections["logs inspected"] = (", ".join(p.name for p in logs)
-                                  if logs else f"{NOT_FOUND} (no log matched in cwd)")
-    sections["first fatal lines (across logs)"] = (
-        "\n".join(scan_errors(log_bodies)) or "no keyword matches; see log tail")
+    inspected = ", ".join(p.name for p in logs) if logs else f"{NOT_FOUND} (no log matched in cwd)"
+    if omitted:
+        inspected += f"  (+{omitted} more logs omitted; cap is {MAX_LOGS})"
+    if missing:
+        inspected += f"  (explicit logs not found: {', '.join(missing)})"
+    sections["logs inspected"] = inspected
+    sections["first fatal lines (scanned from top of each log)"] = (
+        "\n".join(scan_errors(logs)) or "no keyword matches; see log tail")
     for p, body in log_bodies:
         sections[f"log tail: {p.name}"] = body
     sections["source context"] = source_context(log_bodies, cwd)
@@ -367,13 +438,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cwd = Path(args.directory).resolve()
+    if not cwd.is_dir():
+        print(f"error: -C/--directory '{args.directory}' is not a directory",
+              file=sys.stderr)
+        return 2
+
     redact, summary = build_redactor()
     sections = build_sections(cwd, args.logs)
     report = render_report(sections, redact, summary)
 
     if args.output:
         try:
-            Path(args.output).write_text(report)
+            Path(args.output).write_text(report, encoding="utf-8")
             print(f"wrote {args.output}")
         except OSError as exc:
             print(f"could not write {args.output} ({exc}); printing to stdout instead\n",
